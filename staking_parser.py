@@ -1,3 +1,4 @@
+Content is user-generated and unverified.
 #!/usr/bin/env python3
 """
 LMTS staking positions tracker -> Google Sheets.
