@@ -86,6 +86,9 @@ MOVE_THRESHOLD = Decimal(os.getenv("MOVE_THRESHOLD", "10000"))
 DUST_THRESHOLD = Decimal(os.getenv("DUST_THRESHOLD", "0"))
 MOVEMENTS_BACKFILL = os.getenv("MOVEMENTS_BACKFILL", "true").lower() in {"1", "true", "yes"}
 MOVEMENTS_MAX_ROWS = int(os.getenv("MOVEMENTS_MAX_ROWS", "5000"))
+HISTORY_MAX_ROWS = int(os.getenv("HISTORY_MAX_ROWS", "50000"))
+RETAIL_LABEL = os.getenv("RETAIL_LABEL", "Retail")
+NO_LABEL = "(no label)"
 LOG_CHUNK = int(os.getenv("LOG_CHUNK", "100000"))
 MULTICALL_SIZE = int(os.getenv("MULTICALL_SIZE", "300"))
 CALL_BATCH = int(os.getenv("CALL_BATCH", "20"))
@@ -117,6 +120,8 @@ STATE_SHEET = "_State"
 SHEET_POSITIONS = "Staking"
 SHEET_SUMMARY = "Staking_Summary"
 SHEET_MOVEMENTS = "Movements"
+SHEET_BY_LABEL = "Staking_By_Label"
+SHEET_HISTORY = "History"
 
 POSITION_SELECTORS = (SEL_BALANCE_OF, SEL_EARNED, SEL_LAST_STAKED_AT, SEL_TIME_TO_UNLOCK)
 
@@ -752,18 +757,27 @@ def read_our_wallets(ss) -> dict[str, str]:
     return out
 
 
-def append_movements(ss, header: list[str], new_rows: list[list]):
-    ws = ensure_ws(ss, SHEET_MOVEMENTS, rows=max(len(new_rows) + 100, 1000), cols=len(header) + 2)
+def append_sheet(ss, title: str, header: list[str], new_rows: list[list], max_rows: int):
+    """Append-only writer. Rewrites the whole sheet when trimming is needed."""
+    ws = ensure_ws(ss, title, rows=max(len(new_rows) + 100, 1000), cols=len(header) + 2)
     existing = ws.get_all_values()
 
-    if not existing or not existing[0] or existing[0][0].strip().lower() != header[0].lower():
-        write_sheet(ss, SHEET_MOVEMENTS, header, new_rows)
+    header_ok = (
+        existing
+        and existing[0]
+        and existing[0][0].strip().lower() == header[0].lower()
+        and len(existing[0]) == len(header)
+    )
+
+    if not header_ok:
+        write_sheet(ss, title, header, new_rows)
         return
 
     combined = existing[1:] + new_rows
 
-    if MOVEMENTS_MAX_ROWS and len(combined) > MOVEMENTS_MAX_ROWS:
-        write_sheet(ss, SHEET_MOVEMENTS, header, combined[-MOVEMENTS_MAX_ROWS:])
+    if max_rows and len(combined) > max_rows:
+        write_sheet(ss, title, header, combined[-max_rows:])
+        log.info("appended %s rows -> %s (trimmed to %s)", len(new_rows), title, max_rows)
         return
 
     if not new_rows:
@@ -781,10 +795,15 @@ def append_movements(ss, header: list[str], new_rows: list[list]):
         except APIError as e:
             if attempt == 4:
                 raise
-            log.warning("movements append retry: %s", e)
+            log.warning("%s append retry: %s", title, e)
             time.sleep(2 ** attempt)
 
-    log.info("appended %s movements", len(new_rows))
+    log.info("appended %s rows -> %s", len(new_rows), title)
+
+
+def label_sort_key(label: str) -> tuple:
+    """Retail first, then everything else alphabetically, case-insensitive."""
+    return (0 if label == RETAIL_LABEL else 1, label.lower())
 
 
 # =========================
@@ -962,6 +981,60 @@ def main():
     write_sheet(ss, SHEET_POSITIONS, pos_header, pos_rows)
 
     # =====================
+    # BY LABEL + HISTORY
+    # =====================
+    label_totals: dict[str, Decimal] = {}
+    label_counts: dict[str, int] = {}
+
+    for p in active:
+        key = RETAIL_LABEL if not p.is_ours else (p.label.strip() or NO_LABEL)
+        label_totals[key] = label_totals.get(key, Decimal(0)) + p.staked
+        label_counts[key] = label_counts.get(key, 0) + 1
+
+    def label_share(lb: str) -> Decimal:
+        return (label_totals[lb] / total_supply * 100) if total_supply else Decimal(0)
+
+    by_label_header = ["label", "group", "staked_lmts", "share_pct", "wallets"]
+    by_label_rows = [
+        [
+            lb,
+            "RETAIL" if lb == RETAIL_LABEL else "OUR",
+            dec_str(label_totals[lb]),
+            dec_str(label_share(lb), 4),
+            label_counts[lb],
+        ]
+        for lb in sorted(label_totals, key=lambda x: label_totals[x], reverse=True)
+    ]
+    write_sheet(ss, SHEET_BY_LABEL, by_label_header, by_label_rows)
+
+    # append-only: one row per label per run
+    history_header = ["run_utc", "label", "staked_lmts", "group", "wallets", "share_pct", "block"]
+    last_history_block = int(state.get("last_history_block") or 0)
+
+    if target_block == last_history_block:
+        log.info("history already recorded for block %s - skipping", target_block)
+        history_rows: list[list] = []
+    else:
+        run_stamp = datetime.fromtimestamp(
+            clock.get(target_block), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M")
+
+        history_rows = [
+            [
+                run_stamp,
+                lb,
+                dec_str(label_totals[lb], 2),
+                "RETAIL" if lb == RETAIL_LABEL else "OUR",
+                label_counts[lb],
+                dec_str(label_share(lb), 4),
+                target_block,
+            ]
+            for lb in sorted(label_totals, key=label_sort_key)
+        ]
+        append_sheet(ss, SHEET_HISTORY, history_header, history_rows, HISTORY_MAX_ROWS)
+        state["last_history_block"] = str(target_block)
+
+    # =====================
     # SUMMARY
     # =====================
     exited = [p for p in positions.values() if p.staked <= DUST_THRESHOLD]
@@ -1005,13 +1078,15 @@ def main():
         ["events_scanned", len(events)],
         ["scanned_from_block", deploy_block],
         ["movements_added", len(move_rows)],
+        ["labels_tracked", len(label_totals)],
+        ["history_rows_added", len(history_rows)],
         ["timestamps_mode", "exact" if EXACT_TIMESTAMPS else "interpolated (+exact for movements)"],
     ]
 
     write_sheet(ss, SHEET_SUMMARY, ["metric", "value"], summary)
 
     if move_rows:
-        append_movements(ss, move_header, move_rows)
+        append_sheet(ss, SHEET_MOVEMENTS, move_header, move_rows, MOVEMENTS_MAX_ROWS)
     else:
         ws = ensure_ws(ss, SHEET_MOVEMENTS, rows=1000, cols=len(move_header))
         if not ws.get_all_values():
