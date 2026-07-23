@@ -1,0 +1,54 @@
+name: LMTS Staking Tracker
+
+on:
+  schedule:
+    # every hour at :10 UTC
+    - cron: "10 * * * *"
+  workflow_dispatch:
+    inputs:
+      move_threshold:
+        description: "Min LMTS size to log a movement"
+        required: false
+        default: "10000"
+      movements_backfill:
+        description: "Backfill full movement history on first run"
+        required: false
+        default: "true"
+
+concurrency:
+  group: staking-tracker
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth
+
+      - name: Run staking parser
+        env:
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          STAKING_ADDRESS: "0x843c68de2c36c6abbe4a3c28c949ea2f8ba6c195"
+          MOVE_THRESHOLD: ${{ github.event.inputs.move_threshold || '10000' }}
+          MOVEMENTS_BACKFILL: ${{ github.event.inputs.movements_backfill || 'true' }}
+          RATE_LIMIT_RPS: "8"
+          CALL_BATCH: "100"
+          LOG_CHUNK: "100000"
+          LOG_LEVEL: "INFO"
+        run: python staking_parser.py
