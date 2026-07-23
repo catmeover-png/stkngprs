@@ -3,7 +3,7 @@ name: LMTS Staking Tracker
 on:
   schedule:
     # every hour at :10 UTC
-    - cron: "10 * * * *"
+    - cron: "30 8 * * *"
   workflow_dispatch:
     inputs:
       move_threshold:
