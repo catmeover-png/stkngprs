@@ -32,11 +32,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests gspread google-auth
+          pip install -r requirements.txt
 
       - name: Run staking parser
         env:
@@ -46,8 +47,9 @@ jobs:
           STAKING_ADDRESS: "0x843c68de2c36c6abbe4a3c28c949ea2f8ba6c195"
           MOVE_THRESHOLD: ${{ github.event.inputs.move_threshold || '10000' }}
           MOVEMENTS_BACKFILL: ${{ github.event.inputs.movements_backfill || 'true' }}
-          RATE_LIMIT_RPS: "8"
-          CALL_BATCH: "100"
+          RATE_LIMIT_RPS: "4"
+          MULTICALL_SIZE: "300"
+          CALL_BATCH: "20"
           LOG_CHUNK: "100000"
           LOG_LEVEL: "INFO"
         run: python staking_parser.py
